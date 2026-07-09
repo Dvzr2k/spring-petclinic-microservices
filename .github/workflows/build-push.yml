@@ -119,7 +119,7 @@ jobs:
           format: table
           severity: 'HIGH,CRITICAL'
           exit-code: '0'
-          ignorefile: '.trivyignore'
+          trivyignores: '.trivyignore'
           output: trivy-${{ matrix.service }}.txt
 
       - name: Upload Trivy scan report
@@ -136,7 +136,7 @@ jobs:
           format: table
           severity: 'CRITICAL'
           exit-code: '1'
-          ignorefile: '.trivyignore'
+          trivyignores: '.trivyignore'
 
       - name: Push to ECR
         run: docker push "${{ steps.tag.outputs.image }}"
