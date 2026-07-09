@@ -1,0 +1,12 @@
+# Trivy allowlist for known/accepted CVEs (PETPLAT-105).
+#
+# One CVE ID per line. Only add an entry here after reviewing the scan
+# report artifact (uploaded by build-push.yml as "trivy-{service}") and
+# confirming the finding is a false positive or genuinely accepted risk —
+# never add an entry just to make a failing build pass.
+#
+# Format:
+#   CVE-2024-XXXXX
+#
+# Example (remove when adding a real entry):
+# CVE-2023-00000

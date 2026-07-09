@@ -1,0 +1,36 @@
+name: AWS OIDC + ECR Login
+description: >
+  Authenticates to AWS via OIDC (no stored keys) and logs the runner's
+  Docker daemon into ECR. Built as a composite action (not a reusable
+  workflow) specifically so it can run as a step in the middle of a job —
+  a reusable workflow can only be invoked as a whole separate job, which
+  would authenticate on a different runner than the one doing the build,
+  scan, and push. See .github/workflows/reusable/ecr-login.yml for a
+  reusable-workflow wrapper around this same action, usable by any future
+  workflow that only needs a standalone login (its own whole job).
+
+inputs:
+  aws-region:
+    description: AWS region (e.g. eu-central-1)
+    required: true
+  role-to-assume:
+    description: ARN of the IAM role to assume via OIDC
+    required: true
+
+outputs:
+  registry:
+    description: ECR registry hostname (e.g. 123456789012.dkr.ecr.eu-central-1.amazonaws.com)
+    value: ${{ steps.login.outputs.registry }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Login to ECR
+      id: login
+      uses: aws-actions/amazon-ecr-login@v2

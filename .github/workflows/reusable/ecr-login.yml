@@ -1,0 +1,47 @@
+# PETPLAT-53: reusable ECR login workflow.
+#
+# NOTE: build-push.yml does NOT call this file directly. A reusable
+# *workflow* (called via `uses:` at the job level) always runs as its own
+# separate job on its own runner — credentials configured inside it don't
+# carry over to a different job. Since the build/scan/push steps need to
+# run in the SAME authenticated session as the login, build-push.yml calls
+# the composite action at .github/actions/ecr-login/action.yml instead
+# (composite actions run as a step, inline in the calling job).
+#
+# This reusable workflow exists to satisfy the case this ticket is about —
+# a standalone, whole-job login — for any future workflow that only needs
+# to log in to ECR and doesn't need to build/scan/push in that same job.
+name: Reusable - AWS OIDC + ECR Login
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        required: true
+        type: string
+      role-to-assume:
+        required: true
+        type: string
+    outputs:
+      registry:
+        description: ECR registry hostname
+        value: ${{ jobs.login.outputs.registry }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    outputs:
+      registry: ${{ steps.ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS OIDC + ECR login
+        id: ecr
+        uses: ./.github/actions/ecr-login
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.role-to-assume }}

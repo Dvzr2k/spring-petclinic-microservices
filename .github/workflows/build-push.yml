@@ -1,0 +1,170 @@
+# PETPLAT-49 / PETPLAT-105: Build and push ARM64 Docker images for changed
+# services only, gated by a Trivy CRITICAL-vulnerability scan, then notify
+# the platform repo so it can update the Helm image tags. This workflow
+# does not deploy anything — ArgoCD (Epic 17) reads the tag update and
+# handles that separately.
+name: Build and Push Docker Images
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  # PLATFORM_REPO variable may be a bare repo name or a full URL — normalized
+  # to just the repo name at the point of use (see notify-platform-repo job).
+  PLATFORM_REPO: ${{ vars.PLATFORM_REPO }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Detect which of the 8 service directories changed. Filter names are the
+  # SHORT service names (matching helm-values/{service}.yaml in the platform
+  # repo); filter paths point at the actual Maven module directories.
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+
+  # ---------------------------------------------------------------------------
+  # One matrix entry per changed service only (paths-filter's `changes`
+  # output is already a JSON array of just the services that matched).
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute short SHA and image reference
+        id: vars
+        run: |
+          SHA="${GITHUB_SHA::7}"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "module=spring-petclinic-${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: Set up QEMU (ARM64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: AWS OIDC + ECR login
+        id: ecr
+        uses: ./.github/actions/ecr-login
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Build ARM64 image (Maven, scoped to this service only)
+        run: |
+          ./mvnw clean install -pl ${{ steps.vars.outputs.module }} -am \
+            -P buildDocker -Dcontainer.platform="linux/arm64"
+
+      - name: Re-tag image for ECR
+        id: tag
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/petclinic-dev/${{ matrix.service }}:${{ steps.vars.outputs.sha }}"
+          docker tag "springcommunity/${{ steps.vars.outputs.module }}:latest" "${IMAGE}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy scan — full report (HIGH+CRITICAL, non-blocking, for review)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.tag.outputs.image }}
+          format: table
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'
+          ignorefile: '.trivyignore'
+          output: trivy-${{ matrix.service }}.txt
+
+      - name: Upload Trivy scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.service }}
+          path: trivy-${{ matrix.service }}.txt
+
+      - name: Trivy gate — fail on CRITICAL (this is what blocks the push)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.tag.outputs.image }}
+          format: table
+          severity: 'CRITICAL'
+          exit-code: '1'
+          ignorefile: '.trivyignore'
+
+      - name: Push to ECR
+        run: docker push "${{ steps.tag.outputs.image }}"
+
+  # ---------------------------------------------------------------------------
+  # Tell the platform repo which services got new images, so its
+  # update-image-tags.yml can update only those Helm values files.
+  # ---------------------------------------------------------------------------
+  notify-platform-repo:
+    needs: [detect-changes, build-and-push]
+    if: needs.detect-changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute short SHA and space-separated service list
+        id: vars
+        run: |
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "services=$(echo '${{ needs.detect-changes.outputs.services }}' | jq -r 'join(" ")')" >> "$GITHUB_OUTPUT"
+
+      - name: Fire repository_dispatch to platform repo
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
+        run: |
+          # PLATFORM_REPO may be a bare name ("agentic-petclinic-eks-platform")
+          # or a full URL ("https://github.com/owner/agentic-petclinic-eks-platform") —
+          # basename normalizes either form to just the repo name.
+          PLATFORM_REPO_NAME="$(basename "${{ env.PLATFORM_REPO }}")"
+          gh api "repos/${{ github.repository_owner }}/${PLATFORM_REPO_NAME}/dispatches" \
+            -f event_type=app-image-built \
+            -f "client_payload[sha]=${{ steps.vars.outputs.sha }}" \
+            -f "client_payload[services]=${{ steps.vars.outputs.services }}"
